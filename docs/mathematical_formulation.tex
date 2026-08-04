@@ -1,0 +1,499 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath, amssymb, amsthm}
+\usepackage{bm}
+\usepackage{hyperref}
+\usepackage{enumitem}
+\usepackage{booktabs}
+
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\Prob}{\mathbb{P}}
+\newcommand{\Normal}{\mathcal{N}}
+\newcommand{\dt}{\Delta t}
+\newcommand{\bs}{\mathbf s}
+\newcommand{\bz}{\mathbf z}
+\newcommand{\by}{\mathbf y}
+
+\title{Mathematical Formulation of Learning and Sampling for\\ Extreme Ground-Motion Events}
+\author{ExtremeEventFlows}
+\date{}
+
+\begin{document}
+\maketitle
+
+\tableofcontents
+
+\section{Overview}
+
+This document gives the mathematical description of the physical simulation model,
+the rare-event target density, the trainable autoregressive normalizing-flow proposal,
+and the estimators used to learn that proposal and to estimate rare-event
+probabilities. It mirrors the implementation in \texttt{extreme\_event\_flows/}:
+\texttt{source.py}, \texttt{ground\_motion.py}, \texttt{application.py},
+\texttt{target.py}, \texttt{flow.py}, \texttt{training.py}, and
+\texttt{estimators.py}.
+
+The overall goal is to estimate the probability of a rare, extreme event
+(e.g. exceeding an intensity-measure threshold at a site over an exposure window)
+under a physical seismic-source and ground-motion model, using importance
+sampling with a learned proposal that concentrates mass on the failure region.
+
+\section{The physical event sequence}
+
+\subsection{Variable-length marked point process}
+
+The seismic source is modeled as a variable-length sequence of events
+$\mathcal X_N = (\bs_1,\dots,\bs_N)$ arriving on $[0,T]$, where $T$ is the
+exposure time. Each event vector $\bs_i$ collects an arbitrary number of
+physical source parameters, always including an inter-event time increment
+$\dt_i$ so that the $i$-th event occurs at time
+\[
+t_i = \sum_{j=1}^i \dt_j .
+\]
+In the reference example,
+\[
+\bs_i = (\dt_i, M_i, x_i, y_i, d_i),
+\]
+i.e. time increment, magnitude, and 3-D location, but the framework supports
+any named set of scalar event variables (\texttt{source.py:
+GaussianLatentMarkovKernel}).
+
+The process is Markov in the event history: the next event depends only on
+the immediately preceding event. The joint density of a sequence with exactly
+$N$ events inside $[0,T]$ is
+\begin{equation}
+p(\mathcal X_N)
+=
+\prod_{i=1}^{N} p(\bs_i \mid \bs_{i-1})\;
+\Prob\big(\dt_{N+1} > T - t_N \mid \bs_N\big),
+\label{eq:joint-source}
+\end{equation}
+where the last factor is the survival probability that no further event
+occurs before the exposure horizon $T$ is reached, and $\bs_0$ denotes a
+reference (initial) state.
+
+\subsection{Latent-Gaussian transition kernel}
+
+Each physical coordinate $s_{i,j}$ of event $i$ is related to a latent
+Gaussian coordinate $z_{i,j}$ by an invertible scalar transform $T_j$,
+\begin{equation}
+s_{i,j} = T_j(z_{i,j}), \qquad j = 1,\dots,d,
+\end{equation}
+implemented as monotone bijections in \texttt{transforms.py} (e.g. identity,
+softplus/exponential maps enforcing positivity or bounds, each with a
+tractable Jacobian $\log \lvert T_j'(z)\rvert$).
+
+Conditional on the previous physical event $\bs_{i-1}$, the latent vector
+$\bz_i = (z_{i,1},\dots,z_{i,d})$ is jointly Gaussian,
+\begin{equation}
+\bz_i \mid \bs_{i-1} \sim \Normal(\bm\mu_i,\, LL^\top),
+\qquad
+\bm\mu_i = \bm\mu_0 + A\left(\frac{\bs_{i-1} - \bs_{\mathrm{ref}}}{\bm\sigma_{\mathrm{state}}}\right),
+\label{eq:latent-transition}
+\end{equation}
+where $\bm\mu_0 \in \R^d$ is a base mean, $A \in \R^{d\times d}$ is a
+transition matrix creating Markov dependence on every previous-event
+coordinate, $L$ is a lower-triangular Cholesky factor giving a fully coupled
+covariance $LL^\top$ across the coordinates of the current event, and
+$\bs_{\mathrm{ref}}, \bm\sigma_{\mathrm{state}}$ are reference values and
+scales that non-dimensionalize the conditioning feature.
+
+The physical event density follows by the change-of-variables formula,
+\begin{equation}
+p(\bs_i \mid \bs_{i-1})
+=
+\Normal\!\big(\bz_i;\, \bm\mu_i, LL^\top\big)
+\prod_{j=1}^d \left\lvert \frac{d z_{i,j}}{d s_{i,j}} \right\rvert ,
+\qquad \bz_i = (T_1^{-1}(s_{i,1}),\dots,T_d^{-1}(s_{i,d})).
+\label{eq:event-density}
+\end{equation}
+
+\subsection{Time-increment survival}
+
+Because the time increment $\dt$ is one coordinate of $\bs_i$ with its own
+marginal Gaussian latent coordinate (mean $\mu_i^{(\dt)}$, variance
+$\sigma^2_{(\dt)} = \sum_k L_{(\dt),k}^2$ from row $(\dt)$ of $L$), the
+survival probability that no event occurs in the remaining exposure window
+$T - t_N$ is
+\begin{equation}
+\Prob(\dt_{N+1} > r \mid \bs_N)
+=
+\Phi\!\left(-\frac{T_{\dt}^{-1}(r) - \mu_{N+1}^{(\dt)}}{\sigma_{(\dt)}}\right),
+\qquad r = T - t_N,
+\label{eq:survival}
+\end{equation}
+with $\Phi$ the standard normal CDF (\texttt{log\_ndtr} in the code), and the
+degenerate case $r \le$ the transform's lower bound returns log-survival
+$0$.
+
+Sampling the sequence (\texttt{source.py: sample\_sequence}) proceeds by
+repeatedly drawing $\bz_i \sim \Normal(\bm\mu_i, LL^\top)$, mapping to
+physical units, and accepting the event only while $t_i \le T$; the process
+terminates the first time a proposed event time exceeds $T$.
+
+\section{Ground-motion model}
+
+\subsection{Feature construction}
+
+For each accepted source event $i$ and a fixed site, a feature map
+$\bm f_i = f(\bs_i, \text{site})$ is built (\texttt{ground\_motion.py:
+GroundMotionFeatureBuilder}). The reference implementation uses
+\begin{equation}
+\bm f_i = \big(1,\; M_i,\; \log(R_i + R_0),\; \log(V_{s30}/V_{s30}^{\mathrm{ref}}),\; \dots \big),
+\end{equation}
+where $R_i = \lVert (x_i,y_i,d_i) - (x_{\mathrm{site}}, y_{\mathrm{site}}, d_{\mathrm{site}}) \rVert_2$
+is the 3-D source-to-site distance, $R_0$ is a small offset avoiding a
+singularity at zero distance, and additional source/site scalar fields may be
+appended.
+
+\subsection{Multi-output lognormal ground-motion model}
+
+For $K$ intensity-measure outputs (e.g.\ PGA, $SA(0.2\,\mathrm{s})$,
+$SA(1.0\,\mathrm{s})$), a linear model in log space with correlated residuals
+gives, for event $i$,
+\begin{equation}
+\bm\mu_i^{(Y)} = B\bm f_i, \qquad
+\ln \bm Y_i = \bm\mu_i^{(Y)} + L_Y \bm\epsilon_i, \qquad
+\bm\epsilon_i \sim \Normal(0, I_K),
+\label{eq:gmm}
+\end{equation}
+where $B \in \R^{K\times \dim(\bm f)}$ are per-output regression
+coefficients and $L_Y$ is a lower-triangular Cholesky factor of the
+within-event residual covariance, coupling the $K$ outputs (e.g. PGA and
+spectral accelerations are correlated within the same event). The residual
+vector $\bm\epsilon_i$ is a standard normal latent variable exactly as in a
+normalizing flow, with density
+\begin{equation}
+p(\bm\epsilon_i) = \prod_{k=1}^K \Normal(\epsilon_{i,k}; 0, 1).
+\label{eq:gmm-density}
+\end{equation}
+One latent residual is added per ground-motion output; the flow automatically
+grows to include it (\texttt{ground\_motion.py:
+MultiOutputGaussianGroundMotionModel}).
+
+\section{Joint physical (``original'') density}
+
+Composing the source and ground-motion models gives the joint density of a
+complete simulated sample $x = (\mathcal X_N, \{\bm Y_i\}_{i=1}^N)$,
+\begin{equation}
+p(x) = \underbrace{p(\mathcal X_N)}_{\text{Eq.~\eqref{eq:joint-source}}}
+\times
+\underbrace{\prod_{i=1}^N p(\bm\epsilon_i)}_{\text{Eq.~\eqref{eq:gmm-density}}},
+\label{eq:original-density}
+\end{equation}
+computed in \texttt{application.py: log\_original\_density} as the sum of a
+source log-density and a ground-motion (residual) log-density.
+
+\section{Rare-event target}
+
+\subsection{Performance function}
+
+A scalar performance function $g(x)$ maps a complete sample to a real number
+such that the rare/failure event is $F = \{x : g(x) \ge 0\}$
+(\texttt{performance.py}). For a joint ground-motion threshold condition with
+per-output thresholds $\gamma_k$, define the per-event, per-output log
+margin
+\begin{equation}
+r_{i,k} = \log\!\left(\frac{Y_{i,k}}{\gamma_k}\right),
+\end{equation}
+an event score aggregating across outputs $k=1,\dots,K$,
+\begin{equation}
+\text{event score}_i =
+\begin{cases}
+\min_k r_{i,k} & \text{mode = ``all'' (joint exceedance)}\\
+\max_k r_{i,k} & \text{mode = ``any'' (union exceedance)}\\
+r_{i,(m)} & \text{mode = ``$k$-of-$n$'', $m$-th largest margin,}
+\end{cases}
+\end{equation}
+and the sequence-level performance as the maximum over events,
+\begin{equation}
+g(x) = \max_{i=1,\dots,N} \text{event score}_i .
+\end{equation}
+The failure event is then $F = \{x : g(x) \ge 0\}$, i.e. some event in the
+sequence exceeds the threshold condition. General system-level conditions can
+be supplied as an arbitrary callable of the full sample.
+
+\subsection{Smoothed indicator and unnormalized target}
+
+Direct use of the indicator $\mathbb 1_F(x)$ is not differentiable, so a
+smooth penalty is used in place of a hard indicator during training
+(\texttt{target.py: PenaltyFunction}),
+\begin{equation}
+\rho_\alpha(x) = \exp\big(-\alpha\,\mathrm{ReLU}(0 - g(x))\big)
+\quad\Longleftrightarrow\quad
+\log \rho_\alpha(x) = -\alpha\,\mathrm{ReLU}(-g(x)),
+\label{eq:penalty}
+\end{equation}
+with steepness $\alpha > 0$. As $\alpha \to \infty$, $\rho_\alpha(x) \to
+\mathbb 1_F(x)$; $\rho_\alpha(x) = 1$ whenever $g(x) \ge 0$ and decays
+exponentially for $g(x) < 0$.
+
+The unnormalized rare-event target density is
+\begin{equation}
+h(x) = p(x)\,\rho_\alpha(x),
+\qquad
+\log h(x) = \log p(x) + \log \rho_\alpha(x),
+\label{eq:target}
+\end{equation}
+computed by \texttt{target.py: RareEventTargetDensity}. The (unknown)
+normalizing constant of $h$ is closely related to the failure probability of
+interest,
+\begin{equation}
+\Prob(F) = \E_{p}\big[\mathbb 1_F(X)\big] = \int \mathbb 1_F(x)\,p(x)\,dx
+\approx \int \rho_\alpha(x)\,p(x)\,dx = \int h(x)\,dx
+\end{equation}
+in the limit $\alpha \to \infty$; during training $\alpha$ is annealed
+upward (via a progressive threshold schedule, Section~\ref{sec:progressive})
+so that $h$ increasingly concentrates on $F$.
+
+\section{Autoregressive normalizing-flow proposal}
+
+\subsection{Structure}
+
+The trainable proposal $q_\theta(x)$ is an event-by-event autoregressive
+normalizing flow (\texttt{flow.py: AutoregressiveEventFlow}) that mirrors the
+generative structure of $p(x)$ but replaces every conditional Gaussian by a
+learned Gaussian whose mean and scale are outputs of a neural network
+conditioned on the full sequence history through a recurrent hidden state.
+
+Within event $i$, variables are ordered
+\begin{equation}
+v_i = \big(\dt_i,\; \text{remaining source variables},\; \bm\epsilon_i\big)
+\in \R^{m}, \qquad m = |\text{source vars}| + K,
+\end{equation}
+and are generated autoregressively \emph{within} the event and \emph{across}
+events: variable $v_{i,j}$ is conditioned on the recurrent hidden state
+$h_{i-1}$ (summarizing all previous events), the current/remaining exposure
+time, and all previously generated raw variables $v_{i,1:j-1}$ of the same
+event,
+\begin{equation}
+\big(\mu_{i,j}(\theta),\, \log\sigma_{i,j}(\theta)\big)
+=
+\mathrm{MLP}_j\big(h_{i-1},\, t_{i-1}/T,\, (T-t_{i-1})/T,\, v_{i,1:j-1}\big),
+\label{eq:flow-params}
+\end{equation}
+implemented as one small conditional MLP per variable position
+(\texttt{ConditionalMLP}), with $\log\sigma$ squashed into
+$[\log\sigma_{\min}, \log\sigma_{\max}]$ via a sigmoid for numerical
+stability. The raw (latent) variable is drawn
+\begin{equation}
+z_{i,j} \sim \Normal(0,1), \qquad
+\tilde v_{i,j} = \mu_{i,j}(\theta) + \sigma_{i,j}(\theta)\, z_{i,j},
+\end{equation}
+and mapped through the same physical transform $T_j$ used by the source
+model (identity for residual variables, since they are already standard
+Gaussian in the physical model):
+\begin{equation}
+v_{i,j} = T_j(\tilde v_{i,j}).
+\end{equation}
+
+The event-level flow log-density (change of variables) is
+\begin{equation}
+\log q_\theta(v_i \mid h_{i-1})
+=
+\sum_{j=1}^m \Big[\Normal\big(\tilde v_{i,j}; \mu_{i,j}, \sigma_{i,j}^2\big)
+- \log\lvert T_j'(\tilde v_{i,j})\rvert \Big].
+\label{eq:flow-event-density}
+\end{equation}
+
+\subsection{Recurrent state update and stopping}
+
+After event $i$ is generated, the hidden state is updated by a GRU cell
+consuming the raw event vector and normalized event time,
+\begin{equation}
+h_i = \mathrm{GRUCell}\big([\tilde v_i,\; t_i/T],\; h_{i-1}\big),
+\qquad h_0 = h_{\mathrm{init}} \text{ (learned)}.
+\end{equation}
+Sequence generation stops the first time a proposed event time
+$t_{i-1} + \dt_i$ exceeds $T$; as in the physical model, the flow's
+log-density accrues a matching stopping log-probability using the same
+Gaussian time-increment head evaluated as a normal log-survival function
+(Eq.~\eqref{eq:survival}, with $\mu,\sigma$ from Eq.~\eqref{eq:flow-params}
+instead of the physical transition). The complete sequence log-density under
+the proposal is
+\begin{equation}
+\log q_\theta(x)
+=
+\sum_{i=1}^N \log q_\theta(v_i \mid h_{i-1})
+\;+\;
+\log \Prob_\theta(\dt_{N+1} > T - t_N \mid h_N).
+\label{eq:flow-density}
+\end{equation}
+This is a valid joint density over variable-length sequences: it is a
+triangular (autoregressive) transform of an underlying standard-normal base
+sample, so $q_\theta$ is normalized and samples/densities are both tractable
+(\texttt{sample\_one} / \texttt{log\_prob\_one}).
+
+\section{Learning problem}
+
+\subsection{Objective: forward KL / weighted maximum likelihood}
+
+The proposal is trained to approximate the (self-normalized) rare-event
+target $h(x)/Z$, $Z = \int h$, by minimizing the forward Kullback--Leibler
+divergence
+\begin{equation}
+\theta^\star
+=
+\arg\min_\theta \; D_{\mathrm{KL}}\!\left(\frac{h}{Z} \,\Big\|\, q_\theta\right)
+=
+\arg\max_\theta \; \E_{x \sim h/Z}\big[\log q_\theta(x)\big] + \text{const.}
+\label{eq:kl}
+\end{equation}
+Since samples from $h/Z$ are not directly available, a self-normalized
+importance-sampling / cross-entropy estimator is used
+(\texttt{estimators.py: cross\_entropy\_update},
+\texttt{training.py: defensive\_mixture\_update}). Draws are taken from a
+\emph{defensive mixture} proposal that mixes the current flow with the
+original physical model,
+\begin{equation}
+r_\theta(x) = (1-\varepsilon)\, q_\theta(x) + \varepsilon\, p(x),
+\qquad \varepsilon \in (0,1),
+\label{eq:defensive-mixture}
+\end{equation}
+which guarantees non-vanishing support under the physical model even while
+$q_\theta$ is still adapting. For $M$ samples $x^{(1)},\dots,x^{(M)} \sim
+r_\theta$, tempered self-normalized importance weights are formed,
+\begin{equation}
+w^{(m)}
+=
+\frac{\big(h(x^{(m)})/r_\theta(x^{(m)})\big)^{1/\tau}}
+{\sum_{m'=1}^M \big(h(x^{(m')})/r_\theta(x^{(m')})\big)^{1/\tau}}
+=
+\mathrm{softmax}_m\!\left(\frac{\log h(x^{(m)}) - \log r_\theta(x^{(m)})}{\tau}\right),
+\label{eq:weights}
+\end{equation}
+with temperature $\tau > 0$ smoothing the weight distribution, and the
+weighted cross-entropy loss minimized by stochastic gradient (Adam) is
+\begin{equation}
+\mathcal L(\theta) = -\sum_{m=1}^M w^{(m)} \log q_\theta(x^{(m)}),
+\label{eq:loss}
+\end{equation}
+which is an unbiased (in the large-$M$ limit) stochastic estimate of the
+gradient of the KL objective in Eq.~\eqref{eq:kl}. Weights are computed under
+\texttt{torch.no\_grad()} (self-normalized IS is treated as fixed) while only
+$\log q_\theta(x^{(m)})$ carries gradients.
+
+\subsection{Pretraining}
+
+Before any rare-event adaptation, the flow is warm-started by ordinary
+maximum likelihood on samples from the original physical model $p$
+(\texttt{training.py: pretrain\_on\_original\_model}),
+\begin{equation}
+\theta_0 = \arg\min_\theta \; -\frac1M \sum_{m=1}^M \log q_\theta(x^{(m)}),
+\qquad x^{(m)} \overset{\text{iid}}{\sim} p .
+\end{equation}
+This matches $q_\theta \approx p$ before any rare-event penalty is applied,
+providing a stable starting point for cross-entropy adaptation.
+
+\subsection{Progressive threshold schedule}
+\label{sec:progressive}
+
+Directly training against a very rare threshold $\gamma$ from initialization
+is unstable (near-zero effective sample size). Instead, thresholds
+$\gamma_1 < \gamma_2 < \dots < \gamma_L$ are visited in increasing order
+(\texttt{training.py: ProgressiveThresholdTrainer.train\_schedule}), each
+paired with a penalty steepness $\alpha_\ell$; at each stage the flow and
+Adam optimizer state from the previous, easier threshold are retained as the
+initialization,
+\begin{equation}
+\theta_\ell^{(0)} = \theta_{\ell-1}^{\star},
+\qquad
+\theta_\ell^{\star} = \arg\min_\theta \mathcal L_\ell(\theta),
+\end{equation}
+where $\mathcal L_\ell$ uses target $h_\ell(x) = p(x)\rho_{\alpha_\ell}(x)$
+with threshold $\gamma_\ell$ substituted into the performance function. This
+continuation strategy lets a proposal trained for an easier (more probable)
+threshold serve as a good initialization for a rarer one, analogous to
+sequential/adaptive importance sampling and cross-entropy methods for rare
+events.
+
+\subsection{Diagnostics}
+
+Every update reports importance-weight diagnostics used to monitor learning
+health: the maximum normalized weight $\max_m w^{(m)}$, the weight (Shannon)
+entropy $-\sum_m w^{(m)}\log w^{(m)}$, and the weighted effective sample size
+\begin{equation}
+\mathrm{ESS} = \frac{1}{\sum_{m=1}^M (w^{(m)})^2},
+\end{equation}
+which should remain a non-trivial fraction of $M$ for a well-adapted
+proposal.
+
+\section{Sample generation summary}
+
+Generating one complete simulated sample proceeds as follows.
+
+\begin{enumerate}[label=\arabic*.]
+\item \textbf{Initialize} time $t_0 = 0$ and the source state at a reference
+event $\bs_0$ (physical model) or recurrent hidden state $h_0$ (flow).
+\item \textbf{Loop over events} $i = 1, 2, \dots$:
+  \begin{enumerate}[label=(\alph*)]
+  \item Draw the latent Gaussian vector for the next event conditional on the
+  previous state (Eq.~\eqref{eq:latent-transition} for $p$, or
+  Eq.~\eqref{eq:flow-params} autoregressively coordinate-by-coordinate for
+  $q_\theta$), including the time increment $\dt_i$ first.
+  \item Map to physical units via the invertible transforms $T_j$.
+  \item If $t_{i-1} + \dt_i > T$: stop, record the stopping (survival)
+  log-probability, and terminate the sequence with $N = i-1$ events.
+  \item Otherwise accept event $i$, set $t_i = t_{i-1}+\dt_i$, build ground-
+  motion features $\bm f_i$ from the event and site, draw standard-normal
+  residuals $\bm\epsilon_i$ (or their flow equivalents) and compute
+  $\bm Y_i$ via Eq.~\eqref{eq:gmm}, and update the conditioning state/hidden
+  state for the next event.
+  \end{enumerate}
+\item \textbf{Return} the full sample $x = (\mathcal X_N, \{\bm Y_i\})$
+together with its log-density (Eq.~\eqref{eq:original-density} under $p$, or
+Eq.~\eqref{eq:flow-density} under $q_\theta$).
+\end{enumerate}
+
+Because $q_\theta$ shares the same variable ordering, transforms, and
+autoregressive/Markov factorization structure as $p$, it can generate
+sequences of arbitrary (and different) length $N$ while remaining
+absolutely continuous with respect to $p$ almost everywhere, which is what
+makes it usable as an importance-sampling proposal.
+
+\section{Rare-event probability estimation}
+
+\subsection{Naive Monte Carlo}
+
+Direct simulation from the physical model gives an unbiased but typically
+very high-variance estimator for rare $F$ (\texttt{estimators.py:
+estimate\_probability\_naive\_monte\_carlo}),
+\begin{equation}
+\hat P_{\mathrm{MC}} = \frac1M \sum_{m=1}^M \mathbb 1_F(x^{(m)}),
+\qquad x^{(m)} \overset{\text{iid}}{\sim} p,
+\end{equation}
+with a Wilson binomial confidence interval, appropriate when the exceedance
+count may be small or zero.
+
+\subsection{Flow-only importance sampling}
+
+Using the trained flow directly as an importance proposal
+(\texttt{estimate\_probability\_flow\_only}),
+\begin{equation}
+\hat P_{q} = \frac1M \sum_{m=1}^M \mathbb 1_F(x^{(m)})\,
+\frac{p(x^{(m)})}{q_\theta(x^{(m)})},
+\qquad x^{(m)} \overset{\text{iid}}{\sim} q_\theta .
+\end{equation}
+This is unbiased provided $q_\theta$'s support covers $F$, but is used mainly
+as a diagnostic since a poorly-adapted or mode-collapsed flow can miss
+support entirely.
+
+\subsection{Defensive-mixture importance sampling}
+
+The safeguarded, final estimator draws from the same defensive mixture used
+in training (Eq.~\eqref{eq:defensive-mixture}),
+\begin{equation}
+\hat P_{r} = \frac1M \sum_{m=1}^M \mathbb 1_F(x^{(m)})\,
+\frac{p(x^{(m)})}{r_\theta(x^{(m)})},
+\qquad x^{(m)} \sim r_\theta,
+\end{equation}
+which guarantees a bounded importance weight $p(x)/r_\theta(x) \le
+p(x)/(\varepsilon\, p(x)) = 1/\varepsilon$ whenever the sample is drawn from
+the physical component, preventing the unbounded-variance failure mode of a
+pure learned-proposal estimator. All three estimators return standard error,
+a confidence interval, and the importance-weight effective sample size as
+diagnostics of estimator reliability.
+
+\end{document}

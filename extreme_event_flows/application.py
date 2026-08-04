@@ -69,6 +69,7 @@ class GroundMotionApplication(nn.Module):
         sample: SimulationSample,
         exposure_time: float,
     ) -> tuple[Tensor, Tensor, Tensor]:
+        # density assumes sources and observations were generated from sample_original
         log_source = self.source_model.log_prob(sample.source, exposure_time)
         log_ground_motion = self.ground_motion_model.log_prob(sample.ground_motion)
         return log_source, log_ground_motion, log_source + log_ground_motion
